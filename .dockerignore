@@ -1,0 +1,9 @@
+.venv/
+data/
+frost.db*
+models/
+daily.log
+ha_token.txt
+ha_snapshot.json
+__pycache__/
+*.pyc

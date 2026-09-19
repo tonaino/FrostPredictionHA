@@ -1,0 +1,23 @@
+services:
+  frost-forecast:
+    build: .
+    image: frost-forecast:latest
+    container_name: frost-forecast
+    restart: unless-stopped
+    environment:
+      TZ: Europe/Sofia
+      # MQTT broker (HA discovery entities are created automatically)
+      MQTT_BROKER: "192.168.31.200"
+      MQTT_PORT: "1883"
+      MQTT_USER: "${MQTT_USER:-}"
+      MQTT_PASS: "${MQTT_PASS:-}"
+      # Optional: HA station collection via REST (harmless if unset)
+      HA_URL: "http://192.168.31.200:8123"
+      HA_TOKEN: "${HA_TOKEN:-}"
+    volumes:
+      - ./data:/app/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import db; db.init_db(); print('ok')"]
+      interval: 1d
+      timeout: 10s
+      retries: 3

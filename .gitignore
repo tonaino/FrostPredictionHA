@@ -1,0 +1,14 @@
+# secrets — NEVER commit
+.env
+ha_token.txt
+ha_snapshot.json
+
+# data / build artifacts
+frost.db*
+models/
+data/
+.venv/
+__pycache__/
+*.pyc
+daily.log
+.direnv/
