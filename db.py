@@ -8,6 +8,15 @@ DB_PATH = os.environ.get("FROST_DB_PATH") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "frost.db"
 )
 
+SOURCE_PRIORITY = {"openmeteo": 1, "ecowitt": 2, "ha": 3, "manual": 4}
+SOURCE_COLUMNS = {
+    "temp_min": "temp_min_source",
+    "temp_max": "temp_max_source",
+    "temp_mean": "temp_mean_source",
+    "temp_sunset": "temp_sunset_source",
+    "dewpoint_sunset": "dewpoint_sunset_source",
+}
+
 _local = threading.local()
 
 
@@ -41,7 +50,7 @@ CREATE TABLE IF NOT EXISTS stations (
     name         TEXT NOT NULL,
     latitude     REAL,
     longitude    REAL,
-    timezone     TEXT DEFAULT 'Europe/Sofia',
+    timezone     TEXT DEFAULT 'UTC',
     is_active    INTEGER DEFAULT 1,
     created_at   TEXT DEFAULT (datetime('now'))
 );
@@ -107,6 +116,7 @@ CREATE TABLE IF NOT EXISTS predictions (
     frost_probability REAL NOT NULL,         -- 0..1
     tmin_predicted    REAL,                  -- predicted min temp
     tmin_empirical    REAL,                  -- FAO-based estimate
+    tmin_rolling_rf   REAL,                  -- shadow local rolling RF estimate
     features_json     TEXT,                  -- JSON of input features
     observed_frost    INTEGER,               -- 1/0 backfilled after target date
     observed_tmin     REAL,
@@ -122,15 +132,45 @@ CREATE TABLE IF NOT EXISTS outcomes (
     backfilled_at TEXT DEFAULT (datetime('now')),
     PRIMARY KEY (station_id, date)
 );
+
+CREATE TABLE IF NOT EXISTS ecowitt_samples (
+    timestamp TEXT PRIMARY KEY,
+    temp REAL,
+    dewpoint REAL,
+    humidity REAL,
+    wind REAL,
+    gust REAL,
+    pressure REAL,
+    radiation REAL,
+    source TEXT NOT NULL,
+    updated_at TEXT DEFAULT (datetime('now'))
+);
 """
 
 
 def init_db(db_path: str = None):
     with tx(db_path) as conn:
         conn.executescript(SCHEMA)
+        try:
+            conn.execute("ALTER TABLE predictions ADD COLUMN tmin_rolling_rf REAL")
+        except sqlite3.OperationalError:
+            pass
+        # Field-level provenance was added after the original single `source`
+        # column.  Preserve existing data while making future imports obey
+        # HA/Bernacca > Ecowitt > Open-Meteo precedence.
+        for col in SOURCE_COLUMNS.values():
+            try:
+                conn.execute(f"ALTER TABLE observations ADD COLUMN {col} TEXT")
+            except sqlite3.OperationalError:
+                pass
+        for field, source_col in SOURCE_COLUMNS.items():
+            conn.execute(
+                f"UPDATE observations SET {source_col}=source "
+                f"WHERE {field} IS NOT NULL AND {source_col} IS NULL"
+            )
 
 
-def upsert_station(station_id, name, lat, lon, timezone="Europe/Sofia", db_path=None):
+def upsert_station(station_id, name, lat, lon, timezone="UTC", db_path=None):
     with tx(db_path) as conn:
         conn.execute(
             """INSERT INTO stations (station_id, name, latitude, longitude, timezone, is_active)
@@ -153,20 +193,73 @@ def upsert_observation(station_id: str, date: str, fields: dict, source: str, db
     ]
     cols = ["station_id", "date"]
     vals = [station_id, date]
-    sets = ["source=excluded.source", "updated_at=datetime('now')"]
+    sets = ["updated_at=datetime('now')"]
+    conn = get_conn(db_path)
+    existing = conn.execute(
+        "SELECT * FROM observations WHERE station_id = ? AND date = ?",
+        (station_id, date),
+    ).fetchone()
+    incoming_rank = SOURCE_PRIORITY.get(source, 0)
+    accepted = []
     for k in allowed:
         if k in fields and fields[k] is not None:
+            source_col = SOURCE_COLUMNS.get(k)
+            if existing is not None and source_col:
+                old_source = existing[source_col]
+                if old_source and SOURCE_PRIORITY.get(old_source, 0) > incoming_rank:
+                    continue
             cols.append(k)
             vals.append(fields[k])
             sets.append(f"{k}=excluded.{k}")
+            if source_col:
+                cols.append(source_col)
+                vals.append(source)
+                sets.append(f"{source_col}=excluded.{source_col}")
+            accepted.append(k)
     cols.append("source")
     vals.append(source)
-    sql = (
-        f"INSERT INTO observations ({', '.join(cols)}) VALUES ({', '.join('?' * len(vals))}) "
-        f"ON CONFLICT(station_id, date) DO UPDATE SET {', '.join(sets)}"
-    )
+    # Keep the legacy row-level source useful as the highest source accepted
+    # by this write, without allowing a lower-priority write to relabel data.
+    old_row_source = existing["source"] if existing is not None else None
+    row_source = source if accepted or existing is None else old_row_source
+    vals[-1] = row_source
+    sets.append("source=excluded.source")
+    sql = (f"INSERT INTO observations ({', '.join(cols)}) VALUES "
+           f"({', '.join('?' * len(vals))}) ON CONFLICT(station_id, date) DO UPDATE SET "
+           f"{', '.join(sets)}")
     with tx(db_path) as conn:
         conn.execute(sql, vals)
+
+
+def upsert_ecowitt_samples(samples: list, db_path=None):
+    """Store high-frequency Ecowitt samples, deduplicated by timestamp."""
+    conn = get_conn(db_path)
+    for sample in samples:
+        timestamp = sample.get("timestamp")
+        if not timestamp:
+            continue
+        existing = conn.execute(
+            "SELECT source FROM ecowitt_samples WHERE timestamp = ?", (timestamp,)
+        ).fetchone()
+        incoming = SOURCE_PRIORITY.get(sample.get("source", "ecowitt"), 0)
+        if existing and SOURCE_PRIORITY.get(existing["source"], 0) > incoming:
+            continue
+        conn.execute(
+            """INSERT INTO ecowitt_samples
+               (timestamp,temp,dewpoint,humidity,wind,gust,pressure,radiation,source)
+               VALUES (?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(timestamp) DO UPDATE SET
+                 temp=excluded.temp, dewpoint=excluded.dewpoint,
+                 humidity=excluded.humidity, wind=excluded.wind,
+                 gust=excluded.gust, pressure=excluded.pressure,
+                 radiation=excluded.radiation, source=excluded.source,
+                 updated_at=datetime('now')""",
+            (timestamp, sample.get("temp"), sample.get("dewpoint"),
+             sample.get("humidity"), sample.get("wind"), sample.get("gust"),
+             sample.get("pressure"), sample.get("radiation"),
+             sample.get("source", "ecowitt")),
+        )
+    conn.commit()
 
 
 def upsert_climate_rows(station_id: str, rows: list, db_path=None):
@@ -189,15 +282,16 @@ def upsert_climate_rows(station_id: str, rows: list, db_path=None):
 
 
 def save_prediction(station_id, target_date, frost_probability, tmin_predicted,
-                    tmin_empirical, features, model_version_id=None, db_path=None):
+                    tmin_empirical, features, model_version_id=None,
+                    tmin_rolling_rf=None, db_path=None):
     with tx(db_path) as conn:
         cur = conn.execute(
             """INSERT INTO predictions (station_id, target_date, frost_probability,
-                                        tmin_predicted, tmin_empirical, features_json,
-                                        model_version_id)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                                        tmin_predicted, tmin_empirical, tmin_rolling_rf,
+                                        features_json, model_version_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
             (station_id, target_date, frost_probability, tmin_predicted, tmin_empirical,
-             features, model_version_id),
+             tmin_rolling_rf, features, model_version_id),
         )
         return cur.lastrowid
 

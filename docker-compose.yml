@@ -5,15 +5,20 @@ services:
     container_name: frost-forecast
     restart: unless-stopped
     environment:
-      TZ: Europe/Sofia
+      TZ: "${FROST_TZ:-UTC}"
+      FROST_TZ: "${FROST_TZ:-UTC}"
       # MQTT broker (HA discovery entities are created automatically)
-      MQTT_BROKER: "192.168.31.200"
+      MQTT_BROKER: "${MQTT_BROKER:-mqtt}"
       MQTT_PORT: "1883"
       MQTT_USER: "${MQTT_USER:-}"
       MQTT_PASS: "${MQTT_PASS:-}"
       # Optional: HA station collection via REST (harmless if unset)
-      HA_URL: "http://192.168.31.200:8123"
+      HA_URL: "${HA_URL:-http://homeassistant:8123}"
       HA_TOKEN: "${HA_TOKEN:-}"
+      FROST_STATION_ID: "${FROST_STATION_ID:-local_station}"
+      FROST_STATION_NAME: "${FROST_STATION_NAME:-Local weather station}"
+      FROST_LAT: "${FROST_LAT:-0}"
+      FROST_LON: "${FROST_LON:-0}"
     volumes:
       - ./data:/app/data
     healthcheck:

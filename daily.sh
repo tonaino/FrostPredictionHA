@@ -3,7 +3,7 @@
 # Uses the Bernacca HA station when a HA token exists, Open-Meteo otherwise.
 # (On a server, prefer Docker: docker compose up -d — scheduler.py replaces this script.)
 set -e
-cd /Users/antonio/frost-forecast
+cd "$(dirname "$0")"
 [ -f .env ] && set -a && source .env && set +a
 PY=./.venv/bin/python
 

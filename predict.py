@@ -14,6 +14,7 @@ import numpy as np
 import db
 import features as F
 import model
+import rolling_model
 
 
 def _get_evening_row(station_id, date, db_path=None):
@@ -24,9 +25,9 @@ def _get_evening_row(station_id, date, db_path=None):
     ).fetchone()
 
 
-def push_mqtt(prob, tmin_fao, level, target):
+def push_mqtt(prob, tmin_fao, level, target, tmin_rf=None):
     """Publish prediction via MQTT with HA discovery (independent of HA REST API).
-    Broker: MQTT_BROKER env or 192.168.31.200:1883. Retained messages keep values
+     Broker: MQTT_BROKER env or mqtt:1883. Retained messages keep values
     across restarts; discovery makes the sensors appear automatically.
     Returns True if published."""
     import os
@@ -34,7 +35,7 @@ def push_mqtt(prob, tmin_fao, level, target):
     import threading
     import paho.mqtt.client as mqtt
 
-    host = os.environ.get("MQTT_BROKER", "192.168.31.200")
+    host = os.environ.get("MQTT_BROKER", "mqtt")
     port = int(os.environ.get("MQTT_PORT", 1883))
     user = os.environ.get("MQTT_USER") or None
     pw = os.environ.get("MQTT_PASS") or None
@@ -59,14 +60,28 @@ def push_mqtt(prob, tmin_fao, level, target):
             "unit_of_measurement": "°C",
             "value_template": "{{ value_json.tmin }}",
         }),
+        ("tmin_rf", "Frost Tmin Estimate (Rolling RF)", "°C", {
+            "state_topic": f"{base}/tmin_rf",
+            "unique_id": "frost_forecast_tmin_rf",
+            "object_id": "frost_tmin_rf",
+            "unit_of_measurement": "°C",
+            "value_template": "{{ value_json.tmin_rf }}",
+        }),
         ("risk", "Frost Risk Level", None, {
             "state_topic": f"{base}/risk",
             "unique_id": "frost_forecast_risk",
         }),
+        ("cold_warning", "Cold Warning (<3°C)", None, {
+            "state_topic": f"{base}/cold_warning",
+            "unique_id": "frost_forecast_cold_warning",
+            "icon": "mdi:thermometer-alert",
+        }),
     ]
     vals = {"probability": {"p": round(prob * 100, 1)},
             "tmin": {"tmin": round(float(tmin_fao), 1)},
-            "risk": {"risk": level}}
+            "tmin_rf": {"tmin_rf": round(float(tmin_rf), 1) if tmin_rf is not None else None},
+            "risk": {"risk": level},
+            "cold_warning": {"cold_warning": tmin_fao < 3.0}}
 
     client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="frost_forecast")
     if user:
@@ -96,7 +111,14 @@ def push_mqtt(prob, tmin_fao, level, target):
             client.publish(f"homeassistant/sensor/frost_forecast_{key}/config",
                            json.dumps(cfg), retain=True).wait_for_publish()
             # risk is published as plain text (no json template on its config)
-            payload = level if key == "risk" else json.dumps(vals[key])
+            if key == "risk":
+                payload = level
+            elif key == "cold_warning":
+                payload = "ON" if vals[key]["cold_warning"] else "OFF"
+            elif key == "tmin_rf" and vals[key]["tmin_rf"] is None:
+                payload = "unknown"
+            else:
+                payload = json.dumps(vals[key])
             client.publish(f"{base}/{key}", payload, retain=True).wait_for_publish()
             client.publish(f"{base}/{key}_attrs",
                            json.dumps({"forecast_morning": target.isoformat(),
@@ -129,7 +151,16 @@ def predict_tonight(db_path=None):
 
     feats = F.build_features(row, climatology)
     pipe, meta = model.load_model()
-    prob, tmin_ml, tmin_fao, detail = model.predict_frost_probability(feats, pipe, meta, db_path)
+    # Keep the paper-inspired regressor opt-in until its walk-forward error
+    # beats the calibrated FAO/local-bias path on the local dataset.
+    use_regressor = __import__("os").environ.get("FROST_USE_TMIN_REGRESSOR", "0").lower() in (
+        "1", "true", "yes"
+    )
+    regressor, reg_meta = model.load_tmin_regressor() if use_regressor else (None, None)
+    prob, tmin_ml, tmin_fao, detail = model.predict_frost_probability(
+        feats, pipe, meta, db_path, regressor=regressor)
+    rolling_bundle, rolling_meta = rolling_model.load()
+    rolling_tmin = rolling_model.predict_for_observation(row, rolling_bundle, db_path)
 
     version_id = meta.get("version_id") if meta else None
     if version_id is None:
@@ -147,27 +178,35 @@ def predict_tonight(db_path=None):
         tmin_empirical=round(tmin_fao, 2) if tmin_fao is not None else None,
         features=json.dumps(feats),
         model_version_id=version_id,
+        tmin_rolling_rf=rolling_tmin,
         db_path=db_path,
     )
 
     level = ("HIGH" if prob >= 0.6 else
              "MODERATE" if prob >= 0.3 else
              "LOW" if prob >= 0.1 else "VERY LOW")
-    pushed = push_mqtt(prob, tmin_fao, level, target)
+    pushed = push_mqtt(prob, tmin_fao, level, target, rolling_tmin)
     print(f"Frost forecast for morning of {target}")
     print(f"  probability : {prob*100:.0f}%  [{level}]" + ("  -> pushed to HA" if pushed else ""))
     print(f"  Tmin (FAO)  : {tmin_fao:.1f} C")
     print(f"  model detail: {detail}")
+    if rolling_tmin is not None:
+        print(f"  RF rolling Tmin (shadow): {rolling_tmin:.1f} C")
     print(f"  prediction id: {pid}")
 
 
 def train(db_path=None):
     meta, version_id = model.train(db_path)
+    reg_meta = model.train_tmin_regressor(db_path)
+    rolling_meta = rolling_model.train(db_path)
     print("Model trained.")
     print(f"  samples: {meta['n_samples']}  frost events: {meta['n_frost']}")
     print(f"  CV: {meta['cv']}")
     print(f"  FAO coefficients (a,b,c): {meta['fao_coef']}")
     print(f"  version id: {version_id}")
+    print(f"  local Tmin regressor: {reg_meta['n_samples']} samples")
+    print(f"  regressor CV: {reg_meta['cv_mean']}")
+    print(f"  rolling RF: {rolling_meta['n_samples']} samples, CV: {rolling_meta['cv_mean']}")
 
 
 def report(db_path=None):

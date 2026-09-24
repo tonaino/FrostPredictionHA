@@ -9,7 +9,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY db.py features.py model.py collector.py predict.py scheduler.py ./
+COPY db.py features.py model.py collector.py predict.py scheduler.py ecowitt_import.py rolling_model.py ./
 
 # data volume: database + trained models survive container updates
 RUN mkdir -p /app/data && chown -R 1000:1000 /app

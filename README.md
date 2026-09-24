@@ -44,10 +44,21 @@ No HA REST token is needed for the export; only MQTT broker credentials:
 
 | Env | Default | Meaning |
 |---|---|---|
-| `MQTT_BROKER` | 192.168.31.200 | broker host |
+| `MQTT_BROKER` | `mqtt` | broker host or IP |
 | `MQTT_PORT` | 1883 | broker port |
 | `MQTT_USER`/`MQTT_PASS` | — | broker credentials (broker rejects anonymous) |
 | `MQTT_TOPIC` | frost_forecast | topic base |
+
+Station/network settings are supplied through `.env` and are not committed:
+
+```dotenv
+HA_URL=http://homeassistant:8123
+FROST_TZ=UTC
+FROST_LAT=0
+FROST_LON=0
+FROST_STATION_ID=local_station
+FROST_STATION_NAME=Local weather station
+```
 
 Dashboard tile: `sensor.frost_probability`; automations can key on
 `sensor.frost_risk_level` (HIGH triggers `frost_alert_ml_model_high`).
@@ -69,7 +80,8 @@ scp -r frost-forecast/ server:~/            # or git clone
 cd ~/frost-forecast
 
 # optional: enable Bernacca station collection in-container
-echo 'HA_TOKEN=eyJ...your-long-lived-token...' > .env
+cp .env.example .env
+# edit .env with your local HA/MQTT/Ecowitt credentials
 
 docker compose up -d --build
 docker logs -f frost-forecast               # scheduler + pipeline output
@@ -80,10 +92,45 @@ One-off commands inside the container:
 ```bash
 docker compose exec frost-forecast python -m predict tonight   # frost % now
 docker compose exec frost-forecast python -m predict report    # accuracy log
-docker compose exec frost-forecast python -m collector snapshot-ha
+  docker compose exec frost-forecast python -m collector snapshot-ha
+
+## Ecowitt Cloud import
+
+The optional `ecowitt_import.py` importer reads five-minute outdoor history
+from Ecowitt Cloud, derives daily min/max/mean and selects the reading nearest
+sunset+2h for the evening model features. Set the three credentials supplied by
+Ecowitt, then run for any date range:
+
+```bash
+export ECOWITT_API_KEY='...'
+export ECOWITT_APPLICATION_KEY='...'
+export ECOWITT_MAC='AA:BB:CC:DD:EE:FF'
+python ecowitt_import.py --start 2023-01-01 --end 2026-09-24
 ```
 
-Portability notes: `HA_URL` (default `http://192.168.31.200:8123`) is set in
+Imports use the source priority **HA/Bernacca > Ecowitt > Open-Meteo** and do
+not overwrite higher-priority fields.
+
+The importer also stores deduplicated five-minute samples in the
+`ecowitt_samples` table. The shadow rolling-window Random Forest uses these
+samples to estimate the overnight minimum (evening through sunrise). It is
+reported alongside the production forecast but remains disabled as the active
+forecast until its time-held-out error beats the FAO/local-bias model.
+
+The evening input priority is:
+
+1. Bernacca at dynamic sunset+2.
+2. Ecowitt nearest 23:00 when the Bernacca snapshot is unavailable.
+3. No local evening prediction if neither source exists.
+
+The rolling RF estimate is published as the MQTT/HA sensor
+`sensor.frost_tmin_rf` and stored with each prediction. It remains a
+shadow estimate until validation is complete. Telegram automation
+`automation.frost_cold_alert_telegram` reports the alert state, probability,
+FAO/local Tmin and rolling RF Tmin together.
+```
+
+Portability notes: `HA_URL` (default `http://homeassistant:8123`) is set in
 `docker-compose.yml`; no ports are published (the container is an HTTP
 *client* of HA only); run `docker compose restart` after switching tokens.
 
@@ -121,7 +168,7 @@ The standalone scripts can't authenticate to HA without a token. To feed the
 model with on-site Bernacca data instead of (or in addition to) Open-Meteo:
 
 1. HA → Profile → Security → **Long-Lived Access Tokens** → Create
-2. Save it: `echo "eyJ..." > ~/frost-forecast/ha_token.txt`
+2. Save it in `.env` as `HA_TOKEN`, or in the ignored `ha_token.txt` file.
 3. Then run `./.venv/bin/python collector.py pull-ha` (add `pull_ha_longterm_stats()`
    to `daily.sh`) — `import-ha` + `ha_snapshot.json` also work for one-off
    station snapshots.

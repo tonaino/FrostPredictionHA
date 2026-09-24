@@ -25,6 +25,14 @@ MODEL_DIR = os.environ.get("FROST_MODEL_DIR") or os.path.join(
 )
 MODEL_PATH = os.path.join(MODEL_DIR, "frost_model.joblib")
 META_PATH = os.path.join(MODEL_DIR, "frost_model_meta.json")
+REG_MODEL_PATH = os.path.join(MODEL_DIR, "frost_tmin_regressor.joblib")
+REG_META_PATH = os.path.join(MODEL_DIR, "frost_tmin_regressor_meta.json")
+
+LOCAL_SOURCES = ("ha", "ecowitt")
+UNAVAILABLE_AT_EVENING = (
+    "temp_max", "temp_mean", "temp_min", "dewpoint_min",
+    "humidity_mean", "pressure_change",
+)
 
 
 # ------------------------------------------------------------------ FAO layer
@@ -64,6 +72,113 @@ def fit_fao(rows):
 def fao_predict(t_sunset, td_sunset, coef):
     a, b, c = coef
     return a * t_sunset + b * td_sunset + c
+
+
+def local_temperature_bias(db_path=None, limit=14, cap=5.0):
+    """Recent local forecast error, in °C, for online bias correction.
+
+    Positive values mean recent observations were warmer than predicted;
+    negative values mean the local station was colder.  A short, capped,
+    recency-weighted correction adapts to local cold-air pooling without
+    allowing one bad observation to produce an unbounded forecast shift.
+    """
+    conn = db.get_conn(db_path)
+    rows = conn.execute(
+        """SELECT observed_tmin, tmin_empirical
+           FROM predictions
+           WHERE observed_tmin IS NOT NULL AND tmin_empirical IS NOT NULL
+           ORDER BY target_date DESC, prediction_id DESC
+           LIMIT ?""",
+        (limit,),
+    ).fetchall()
+    if not rows:
+        return 0.0
+    # Newest observation has weight 1, then 0.9, 0.8, ...
+    weights = [max(0.1, 1.0 - i * 0.1) for i in range(len(rows))]
+    bias = sum(w * (r["observed_tmin"] - r["tmin_empirical"])
+               for w, r in zip(weights, rows)) / sum(weights)
+    return max(-cap, min(cap, float(bias)))
+
+
+def _forecast_safe_features(feats):
+    """Remove same-day values that are unavailable at evening forecast time."""
+    safe = dict(feats)
+    for key in UNAVAILABLE_AT_EVENING:
+        safe[key] = None
+    return safe
+
+
+def train_tmin_regressor(db_path=None, random_state=42):
+    """Train a local-station Tmin regressor using forecast-safe features."""
+    import joblib
+    from sklearn.ensemble import RandomForestRegressor
+    from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+    from sklearn.model_selection import TimeSeriesSplit
+
+    conn = db.get_conn(db_path)
+    rows = conn.execute(
+        """SELECT o.*, l.temp_min AS next_temp_min,
+                  l.temp_min_source AS next_temp_min_source
+           FROM observations o
+           JOIN observations l ON l.station_id = o.station_id
+            AND l.date = date(o.date, '+1 day')
+           WHERE o.temp_sunset IS NOT NULL
+             AND o.dewpoint_sunset IS NOT NULL
+             AND o.temp_sunset_source IN ('ha', 'ecowitt')
+             AND o.dewpoint_sunset_source IN ('ha', 'ecowitt')
+             AND l.temp_min IS NOT NULL
+             AND l.temp_min_source IN ('ha', 'ecowitt')
+           ORDER BY o.date"""
+    ).fetchall()
+    if len(rows) < 60:
+        raise RuntimeError(f"Not enough local rows for Tmin regression ({len(rows)})")
+    clim_rows = conn.execute("SELECT * FROM climate_history").fetchall()
+    clim = F.day_of_year_frost_climatology(clim_rows, rows[0]["station_id"])
+    X, y = [], []
+    for row in rows:
+        feats = _forecast_safe_features(F.build_features(row, clim))
+        X.append(F.features_to_vector(feats))
+        y.append(row["next_temp_min"])
+    X, y = np.asarray(X, dtype=float), np.asarray(y, dtype=float)
+    from sklearn.impute import SimpleImputer
+    imputer = SimpleImputer(strategy="median", keep_empty_features=True)
+    X_imp = imputer.fit_transform(X)
+    reg = RandomForestRegressor(
+        n_estimators=500, min_samples_leaf=4, max_features="sqrt",
+        random_state=random_state, n_jobs=-1,
+    )
+    cv = []
+    for tr, te in TimeSeriesSplit(n_splits=5).split(X_imp):
+        fold = RandomForestRegressor(
+            n_estimators=300, min_samples_leaf=4, max_features="sqrt",
+            random_state=random_state, n_jobs=-1,
+        )
+        fold.fit(X_imp[tr], y[tr])
+        pred = fold.predict(X_imp[te])
+        cv.append({"mae": float(mean_absolute_error(y[te], pred)),
+                   "rmse": float(np.sqrt(mean_squared_error(y[te], pred))),
+                   "r2": float(r2_score(y[te], pred))})
+    reg.fit(X_imp, y)
+    joblib.dump({"imputer": imputer, "model": reg}, REG_MODEL_PATH)
+    meta = {
+        "trained_at": __import__("datetime").datetime.now().isoformat(timespec="seconds"),
+        "n_samples": len(y), "cv": cv,
+        "cv_mean": {k: float(np.mean([x[k] for x in cv])) for k in cv[0]},
+        "feature_names": F.FEATURE_NAMES,
+        "source_priority": "ha/ecowitt only",
+    }
+    with open(REG_META_PATH, "w") as f:
+        json.dump(meta, f, indent=2)
+    return meta
+
+
+def load_tmin_regressor():
+    import joblib
+    if not os.path.exists(REG_MODEL_PATH):
+        return None, None
+    with open(REG_META_PATH) as f:
+        meta = json.load(f)
+    return joblib.load(REG_MODEL_PATH), meta
 
 
 def radiative_night_factor(wind_max, cloud_mean):
@@ -191,7 +306,7 @@ def load_model():
 
 # ------------------------------------------------------------------ inference
 
-def predict_frost_probability(feats, pipe, meta, db_path=None):
+def predict_frost_probability(feats, pipe, meta, db_path=None, regressor=None):
     """Returns (probability, tmin_ml_estimate, tmin_fao).
 
     tmin_ml_estimate: regression-style estimate via blended physics prior when
@@ -204,12 +319,19 @@ def predict_frost_probability(feats, pipe, meta, db_path=None):
     if t is None or td is None:
         raise ValueError("temp_sunset and dewpoint_sunset are required")
     tmin_fao = fao_predict(t, td, fao_coef)
+    tmin_raw = tmin_fao
+    if regressor is not None:
+        safe = _forecast_safe_features(feats)
+        x = np.asarray([F.features_to_vector(safe)], dtype=float)
+        tmin_raw = float(regressor["model"].predict(regressor["imputer"].transform(x))[0])
+    bias_c = local_temperature_bias(db_path)
+    tmin_estimate = tmin_raw + bias_c
     rad = radiative_night_factor(feats.get("wind_max"), feats.get("cloud_mean"))
 
     # physics-based probability: logistic mapping on predicted Tmin margin
     # P ~ sigmoid(-(Tmin - 0)/width): Tmin below 0 -> P > 0.5
     width = 1.5  # C
-    p_phys = 1.0 / (1.0 + math.exp((tmin_fao + 0.5) / width))
+    p_phys = 1.0 / (1.0 + math.exp((tmin_estimate + 0.5) / width))
     # blend toward climatology for advection nights where FAO is unreliable
     p_clim = feats.get("clim_frost", 0.0)
     p_blend = rad * p_phys + (1.0 - rad) * max(p_phys, p_clim)
@@ -228,5 +350,7 @@ def predict_frost_probability(feats, pipe, meta, db_path=None):
     else:
         p_final, p_ml = p_blend, None
 
-    return float(p_final), tmin_ml, tmin_fao, {"p_ml": p_ml, "p_phys": p_phys,
-                                                "p_clim": p_clim, "rad_factor": rad}
+    return float(p_final), tmin_ml, tmin_estimate, {"p_ml": p_ml, "p_phys": p_phys,
+                                                "p_clim": p_clim, "rad_factor": rad,
+                                                "tmin_raw": tmin_raw, "tmin_fao": tmin_fao,
+                                                "local_bias_c": bias_c}

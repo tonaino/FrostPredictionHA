@@ -11,10 +11,16 @@ Usage:  python scheduler.py            # run scheduler loop (container entrypoin
 import subprocess
 import sys
 import time
+import os
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
-TZ_OFFSET_OK = True
-RUN_HOUR, RUN_MINUTE = 21, 45
+import requests
+
+TZ = ZoneInfo(os.environ.get("FROST_TZ", "UTC"))
+LAT = float(os.environ.get("FROST_LAT", "0"))
+LON = float(os.environ.get("FROST_LON", "0"))
+FALLBACK_HOUR, FALLBACK_MINUTE = 21, 45
 
 
 def _run(label, cmd):
@@ -41,11 +47,11 @@ def run_pipeline():
     if has_token():
         # HA station mode: evening snapshot + mid-week stats refresh
         _run("snapshot-ha", ["-m", "collector", "snapshot-ha"])
-        if datetime.now().weekday() == 2:  # Wednesday
+        if datetime.now(TZ).weekday() == 2:  # Wednesday
             _run("pull-ha", ["-m", "collector", "pull-ha"])
     else:
         _run("snapshot", ["-m", "collector", "snapshot"])
-    if datetime.now().weekday() == 6:  # Sunday
+    if datetime.now(TZ).weekday() == 6:  # Sunday
         _run("pull-history", ["-m", "collector", "pull-history"])
         _run("train", ["-m", "predict", "train"])
     _run("tonight", ["-m", "predict", "tonight"])
@@ -64,18 +70,69 @@ def _missing_todays_prediction():
     return row["n"] == 0
 
 
-def seconds_until_next_run():
-    now = datetime.now()
-    target = now.replace(hour=RUN_HOUR, minute=RUN_MINUTE, second=0, microsecond=0)
+def next_snapshot_time(now=None):
+    """Return the next local sunset+2h run time.
+
+    The station snapshot must be taken after the evening radiative window
+    begins, not at a fixed clock time. Keep the old time as a safe fallback
+    if the astronomy API is unavailable.
+    """
+    now = now or datetime.now(TZ)
+    try:
+        r = requests.get(
+            "https://api.open-meteo.com/v1/forecast",
+            params={
+                "latitude": LAT, "longitude": LON,
+                "daily": "sunset", "timezone": os.environ.get("FROST_TZ", "UTC"),
+                "forecast_days": 2,
+            }, timeout=15,
+        )
+        r.raise_for_status()
+        sunsets = r.json()["daily"]["sunset"]
+        for value in sunsets:
+            target = datetime.fromisoformat(value).replace(tzinfo=TZ) + timedelta(hours=2)
+            if target > now:
+                return target
+    except Exception as e:
+        print(f"[scheduler] sunset lookup failed, using fallback: {e}", flush=True)
+    target = now.replace(hour=FALLBACK_HOUR, minute=FALLBACK_MINUTE,
+                         second=0, microsecond=0)
     if target <= now:
         target += timedelta(days=1)
-    return (target - now).total_seconds()
+    return target
+
+
+def today_snapshot_time(now=None):
+    """Today's sunset+2h time, used for startup catch-up."""
+    now = now or datetime.now(TZ)
+    try:
+        r = requests.get(
+            "https://api.open-meteo.com/v1/forecast",
+            params={
+                "latitude": LAT, "longitude": LON,
+                "daily": "sunset", "timezone": os.environ.get("FROST_TZ", "UTC"),
+                "forecast_days": 1,
+            }, timeout=15,
+        )
+        r.raise_for_status()
+        value = r.json()["daily"]["sunset"][0]
+        return datetime.fromisoformat(value).replace(tzinfo=TZ) + timedelta(hours=2)
+    except Exception as e:
+        print(f"[scheduler] today's sunset lookup failed, using fallback: {e}", flush=True)
+        return now.replace(hour=FALLBACK_HOUR, minute=FALLBACK_MINUTE,
+                           second=0, microsecond=0)
+
+
+def seconds_until_next_run():
+    return max(1.0, (next_snapshot_time() - datetime.now(TZ)).total_seconds())
 
 
 def loop():
     while True:
         wait = seconds_until_next_run()
-        print(f"[scheduler] next run in {wait/3600:.1f}h", flush=True)
+        target = next_snapshot_time()
+        print(f"[scheduler] next Bernacca snapshot at {target.isoformat()} "
+              f"(in {wait/3600:.1f}h)", flush=True)
         time.sleep(max(wait, 1))
         try:
             run_pipeline()
@@ -89,7 +146,7 @@ if __name__ == "__main__":
         sys.exit(0)
     # catch-up: if started after 21:45 and today's prediction is missing, run now
     try:
-        if datetime.now().hour >= RUN_HOUR and _missing_todays_prediction():
+        if datetime.now(TZ) >= today_snapshot_time() and _missing_todays_prediction():
             print("[scheduler] catch-up run on startup", flush=True)
             run_pipeline()
     except Exception as e:

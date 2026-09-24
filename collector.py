@@ -19,22 +19,24 @@ import json
 import os
 import sys
 from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import requests
 
 import db
 
-HA_URL = os.environ.get("HA_URL", "http://192.168.31.200:8123")
+HA_URL = os.environ.get("HA_URL", "http://homeassistant:8123")
 HA_TOKEN = os.environ.get("HA_TOKEN", "")
 HA_TOKEN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ha_token.txt")
 HA_SNAPSHOT_FILE = os.environ.get("HA_SNAPSHOT_FILE") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "ha_snapshot.json"
 )
 
-STATION_ID = "gorna_malina"
-STATION_NAME = "Gorna Malina / MeteoCasa"
-LAT, LON = 42.25, 23.85
-TZ = "Europe/Sofia"
+STATION_ID = os.environ.get("FROST_STATION_ID", "local_station")
+STATION_NAME = os.environ.get("FROST_STATION_NAME", "Local weather station")
+LAT = float(os.environ.get("FROST_LAT", "0"))
+LON = float(os.environ.get("FROST_LON", "0"))
+TZ = os.environ.get("FROST_TZ", "UTC")
 
 UA = {"User-Agent": "frost-collector/1.0"}
 
@@ -206,6 +208,49 @@ def import_ha_snapshot(db_path=None):
     print(f"HA snapshot imported for {today}: {snap}")
 
 
+def _pull_ha_history_temperature(db_path=None, days=10):
+    """Import recent Bernacca temperatures from HA's history REST API.
+
+    HA exposes recorder history through REST, while long-term statistics are
+    available through the WebSocket API (not ``/api/statistics/period``).
+    History retention is normally about ten days, so this is a fallback for
+    recent station data when the WebSocket client is unavailable.
+    """
+    # The REST history endpoint commonly retains only the recorder purge
+    # window (normally ten days), even when a larger range is requested.
+    days = min(days, 10)
+    start = datetime.now(ZoneInfo(TZ)) - timedelta(days=days)
+    params = {
+        "filter_entity_id": "sensor.bernacca_outdoor_temperature",
+        "minimal_response": "true",
+        "no_attributes": "true",
+    }
+    r = requests.get(
+        f"{HA_URL}/api/history/period/{start.isoformat()}",
+        headers=_ha_headers(), params=params, timeout=90,
+    )
+    r.raise_for_status()
+    rows = (r.json() or [[]])[0]
+    by_day = {}
+    for row in rows:
+        try:
+            value = float(row["state"])
+            local_day = datetime.fromisoformat(row["last_changed"]).astimezone(
+                ZoneInfo(TZ)
+            ).date().isoformat()
+        except (KeyError, TypeError, ValueError):
+            continue
+        by_day.setdefault(local_day, []).append(value)
+    for day, values in sorted(by_day.items()):
+        db.upsert_observation(
+            STATION_ID, day,
+            {"temp_min": min(values), "temp_max": max(values),
+             "temp_mean": sum(values) / len(values)},
+            source="ha", db_path=db_path,
+        )
+    print(f"Imported {len(by_day)} Bernacca temperature days from HA history.")
+
+
 def pull_ha_longterm_stats(db_path=None, days=90):
     """Optional: pull per-day aggregates from HA long-term statistics."""
     db.upsert_station(STATION_ID, STATION_NAME, LAT, LON, TZ, db_path)
@@ -222,6 +267,9 @@ def pull_ha_longterm_stats(db_path=None, days=90):
         try:
             r = requests.post(f"{HA_URL}/api/statistics/period", headers=headers,
                               json=payload, timeout=60)
+            if r.status_code == 404 and entity_id == "sensor.bernacca_outdoor_temperature":
+                _pull_ha_history_temperature(db_path=db_path, days=days)
+                continue
             r.raise_for_status()
             data = r.json()
         except Exception as e:
