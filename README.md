@@ -27,9 +27,10 @@ Talsma et al. 2023 and Eccel et al. 2007):
 - Database: `frost.db` — 10 years (3652 days) climate history, 3 years of
   bootstrap observations + recent daily aggregates, prediction log with
   observed-outcome backfill and hit/miss scoring.
-- Trained model: 1095 samples, 162 frost events, **CV AUC 0.951**, Brier 0.079.
-- Daily automation: `launchctl` job `com.frostforecast.daily` runs `daily.sh`
-  at **21:45** (after sunset + 2h, the FAO measurement time).
+- Active model: hybrid FAO/classifier with local bias correction; a rolling
+  Ecowitt Random Forest runs alongside it in shadow mode.
+- Daily automation: the container scheduler runs at local astronomical
+  **sunset+2h**; 21:45 is only the API-failure fallback.
 - HA automation: `automation.frost_alert_evening_forecast_check` — 20:00
   forecast check, phone + persistent notification when forecast overnight low
   <= 2 °C.
@@ -38,8 +39,9 @@ Talsma et al. 2023 and Eccel et al. 2007):
 
 Every night after the prediction, the model publishes to the MQTT broker with
 **HA discovery** — entities `sensor.frost_probability`, `sensor.frost_tmin_estimate`
-and `sensor.frost_risk_level` appear automatically under the "Frost Forecast"
-device, with retained state (values survive HA restarts without re-publish).
+`sensor.frost_tmin_rf`, `sensor.frost_cold_warning_3degc` and
+`sensor.frost_risk_level` appear automatically under the "Frost Forecast"
+device, with retained state.
 No HA REST token is needed for the export; only MQTT broker credentials:
 
 | Env | Default | Meaning |
@@ -94,7 +96,8 @@ One-off commands inside the container:
 ```bash
 docker compose exec frost-forecast python -m predict tonight   # frost % now
 docker compose exec frost-forecast python -m predict report    # accuracy log
-  docker compose exec frost-forecast python -m collector snapshot-ha
+docker compose exec frost-forecast python -m collector snapshot-ha
+```
 
 ## Ecowitt Cloud import
 
@@ -130,8 +133,6 @@ The rolling RF estimate is published as the MQTT/HA sensor
 shadow estimate until validation is complete. Telegram automation
 `automation.frost_cold_alert_telegram` reports the alert state, probability,
 FAO/local Tmin and rolling RF Tmin together.
-```
-
 Portability notes: `HA_URL` (default `http://homeassistant:8123`) is set in
 `docker-compose.yml`; no ports are published (the container is an HTTP
 *client* of HA only); run `docker compose restart` after switching tokens.
@@ -160,9 +161,8 @@ Manual one-off test of the full cycle: `./daily.sh`
 
 | Source | What | Used for |
 |---|---|---|
-| Open-Meteo archive API | 10y daily T/Td/precip/wind/cloud | climatology + model training |
-| Open-Meteo forecast API | hourly data incl. sunset+2h values | evening snapshot, daily aggregates |
-| HA Bernacca station (optional) | real on-site T/Td/humidity/wind/soil | richer features via token |
+| Ecowitt Cloud / HA Bernacca | local high-frequency temperature and weather data | primary training and evening inputs |
+| Open-Meteo | sunset timing, cloud fallback, optional bootstrap | astronomy/fallback only |
 
 ## Optional: connect the real weather station
 
@@ -185,8 +185,8 @@ From **Open-Meteo**: 10-year history + hourly evening values, cloud cover.
 
 ## Model improvement loop
 
-- 21:45 daily: snapshot → prediction stored → next day observed Tmin backfills
+- Sunset+2h daily: snapshot → FAO + rolling RF predictions stored → next day observed Tmin backfills
   the outcome and scores the prediction (`hit`).
-- Sundays: aggregates refreshed + model retrained on all labeled data.
+- Sundays: aggregates refreshed + both models retrained on labeled local data.
 - `predict.py report` shows running accuracy; the ML layer's trust in itself
   grows automatically as real frost events accumulate.
