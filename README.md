@@ -31,9 +31,8 @@ Talsma et al. 2023 and Eccel et al. 2007):
   Ecowitt Random Forest runs alongside it in shadow mode.
 - Daily automation: the container scheduler runs at local astronomical
   **sunset+2h**; 21:45 is only the API-failure fallback.
-- HA automation: `automation.frost_alert_evening_forecast_check` — 20:00
-  forecast check, phone + persistent notification when forecast overnight low
-  <= 2 °C.
+- Telegram automation: `automation.frost_cold_alert_telegram` sends one
+  consolidated message after each completed MQTT forecast publication.
 
 ## HA entity export (MQTT)
 
@@ -62,12 +61,15 @@ FROST_STATION_ID=local_station
 FROST_STATION_NAME=Local weather station
 ```
 
-Dashboard tile: `sensor.frost_probability`; automations can key on
-`sensor.frost_risk_level` (HIGH triggers `frost_alert_ml_model_high`).
+Dashboard tiles: `sensor.frost_probability`, `sensor.frost_tmin_estimate`,
+`sensor.frost_tmin_rf`, `sensor.frost_risk_level`, and the cold-warning sensor.
+The Telegram message includes the target morning, Bernacca current
+temperature/dew point, probability, risk, FAO Tmin, RF Tmin, and cold-warning
+state.
 
-Two frost automations exist (independent layers):
-1. `frost_alert_evening_forecast_check` — 20:00 forecast-based (weather entity)
-2. `frost_alert_ml_model_high` — ML-model-driven, fires on HIGH push
+The main consolidated notification is triggered by the final
+`frost_forecast/risk` MQTT publication, so it sends once per forecast. Legacy
+Pixel/persistent automations may remain enabled separately if desired.
 
 ## Docker deployment (server)
 
