@@ -69,10 +69,12 @@ Two frost automations exist (independent layers):
 
 ## Docker deployment (server)
 
-The container runs its own scheduler (`scheduler.py`) — 21:45 daily pipeline,
-Wed 03:45 mid-week HA stats refresh, Sunday refresh+retrain, plus a catch-up
-run if started late. Data lives in `./data/` (SQLite + models), so the
-container can be rebuilt or upgraded without losing history.
+The container runs its own scheduler (`scheduler.py`) — a daily pipeline at
+the local astronomical **sunset+2h** time, a Wednesday mid-week HA history
+refresh, Sunday refresh+retrain, plus a catch-up run if started late. A fixed
+21:45 time is used only as a fallback when the sunset lookup is unavailable.
+Data lives in `./data/` (SQLite + models), so the container can be rebuilt or
+upgraded without losing history.
 
 ```bash
 # on the server (Docker + compose required)
