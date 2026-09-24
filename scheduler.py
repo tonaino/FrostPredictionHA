@@ -57,6 +57,13 @@ def run_pipeline():
     _run("tonight", ["-m", "predict", "tonight"])
 
 
+def run_morning_report():
+    """Capture the overnight minimum and send the performance summary."""
+    if has_token():
+        _run("morning-observation", ["-m", "collector", "morning-report"])
+        _run("morning-performance", ["-m", "predict", "performance"])
+
+
 def _missing_todays_prediction():
     """True if we haven't predicted for tomorrow yet today (catch-up check)."""
     import db
@@ -124,18 +131,31 @@ def today_snapshot_time(now=None):
 
 
 def seconds_until_next_run():
-    return max(1.0, (next_snapshot_time() - datetime.now(TZ)).total_seconds())
+    now = datetime.now(TZ)
+    evening = next_snapshot_time(now)
+    morning = now.replace(hour=8, minute=0, second=0, microsecond=0)
+    if morning <= now:
+        morning += timedelta(days=1)
+    return max(1.0, (min(evening, morning) - now).total_seconds())
 
 
 def loop():
     while True:
         wait = seconds_until_next_run()
-        target = next_snapshot_time()
-        print(f"[scheduler] next Bernacca snapshot at {target.isoformat()} "
+        now = datetime.now(TZ)
+        evening = next_snapshot_time(now)
+        morning = now.replace(hour=8, minute=0, second=0, microsecond=0)
+        if morning <= now:
+            morning += timedelta(days=1)
+        target, label = (morning, "morning performance") if morning < evening else (evening, "Bernacca snapshot")
+        print(f"[scheduler] next {label} at {target.isoformat()} "
               f"(in {wait/3600:.1f}h)", flush=True)
         time.sleep(max(wait, 1))
         try:
-            run_pipeline()
+            if label == "morning performance":
+                run_morning_report()
+            else:
+                run_pipeline()
         except Exception as e:  # keep the scheduler alive
             print(f"[scheduler] pipeline error: {e}", flush=True)
 
@@ -144,7 +164,7 @@ if __name__ == "__main__":
     if "--now" in sys.argv:
         run_pipeline()
         sys.exit(0)
-    # catch-up: if started after 21:45 and today's prediction is missing, run now
+    # Catch-up evening run if started after today's sunset+2 and prediction is missing.
     try:
         if datetime.now(TZ) >= today_snapshot_time() and _missing_todays_prediction():
             print("[scheduler] catch-up run on startup", flush=True)

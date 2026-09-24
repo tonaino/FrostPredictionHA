@@ -135,6 +135,12 @@ The rolling RF estimate is published as the MQTT/HA sensor
 shadow estimate until validation is complete. Telegram automation
 `automation.frost_cold_alert_telegram` reports the alert state, probability,
 FAO/local Tmin and rolling RF Tmin together.
+
+At 08:00 local time, the scheduler imports the overnight Bernacca minimum and
+publishes a non-retained `frost_forecast/performance` MQTT event. The separate
+`automation.frost_prediction_performance_telegram` sends one morning summary
+with the current temperature, observed Tmin, predicted Tmin, RF Tmin, signed
+temperature error, and percentage error.
 Portability notes: `HA_URL` (default `http://homeassistant:8123`) is set in
 `docker-compose.yml`; no ports are published (the container is an HTTP
 *client* of HA only); run `docker compose restart` after switching tokens.

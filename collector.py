@@ -423,6 +423,13 @@ def backfill_outcomes(db_path=None):
     print(f"Scoring: {db.model_stats(db_path)}")
 
 
+def morning_report(db_path=None):
+    """Import the overnight Bernacca minimum and score the latest forecast."""
+    _pull_ha_history_temperature(db_path=db_path, days=2)
+    backfill_outcomes(db_path=db_path)
+    print("Morning observation and forecast scoring complete.")
+
+
 if __name__ == "__main__":
     db.init_db()
     cmd = sys.argv[1] if len(sys.argv) > 1 else "help"
@@ -442,5 +449,7 @@ if __name__ == "__main__":
         import_ha_snapshot()
     elif cmd == "outcomes":
         backfill_outcomes()
+    elif cmd == "morning-report":
+        morning_report()
     else:
         print(__doc__)

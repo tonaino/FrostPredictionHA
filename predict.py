@@ -219,6 +219,59 @@ def report(db_path=None):
               f"Tmin_fao={p['tmin_empirical']}  {obs}  hit={p['hit']}")
 
 
+def performance(db_path=None):
+    """Publish one non-retained MQTT event for the latest scored forecast."""
+    import os
+    import paho.mqtt.client as mqtt
+    import collector
+    conn = db.get_conn(db_path)
+    row = conn.execute(
+        """SELECT * FROM predictions
+           WHERE observed_tmin IS NOT NULL
+           ORDER BY target_date DESC, prediction_id DESC LIMIT 1"""
+    ).fetchone()
+    if row is None:
+        print("No scored forecast available yet.")
+        return
+    predicted = row["tmin_predicted"] if row["tmin_predicted"] is not None else row["tmin_empirical"]
+    actual = row["observed_tmin"]
+    error = actual - predicted
+    error_pct = (error / abs(predicted) * 100.0) if predicted and abs(predicted) >= 1.0 else None
+    payload = {
+        "target_date": row["target_date"],
+        "current_temperature": None,
+        "predicted_tmin": round(predicted, 2),
+        "rolling_rf_tmin": row["tmin_rolling_rf"],
+        "observed_tmin": round(actual, 2),
+        "error_c": round(error, 2),
+        "error_pct": round(error_pct, 1) if error_pct is not None else None,
+        "forecast_probability": round(row["frost_probability"] * 100, 1),
+    }
+    try:
+        import requests
+        state = requests.get(
+            f"{collector.HA_URL}/api/states/sensor.bernacca_outdoor_temperature",
+            headers=collector._ha_headers(), timeout=15,
+        )
+        if state.ok:
+            payload["current_temperature"] = float(state.json()["state"])
+    except Exception:
+        pass
+    host = os.environ.get("MQTT_BROKER", "mqtt")
+    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="frost_performance")
+    user, pw = os.environ.get("MQTT_USER") or None, os.environ.get("MQTT_PASS") or None
+    if user:
+        client.username_pw_set(user, pw)
+    client.connect(host, int(os.environ.get("MQTT_PORT", "1883")), keepalive=30)
+    client.loop_start()
+    client.publish(
+        f"{os.environ.get('MQTT_TOPIC', 'frost_forecast')}/performance",
+        json.dumps(payload), retain=False,
+    ).wait_for_publish()
+    client.loop_stop()
+    print(f"Published morning performance: {payload}")
+
+
 if __name__ == "__main__":
     import collector
     db.init_db()
@@ -229,5 +282,7 @@ if __name__ == "__main__":
         train()
     elif cmd == "report":
         report()
+    elif cmd == "performance":
+        performance()
     else:
         print(__doc__)
